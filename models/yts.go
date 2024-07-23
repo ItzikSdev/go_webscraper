@@ -8,14 +8,13 @@ import (
 )
 
 type Movie struct {
-	ID      uuid.UUID `json:"id"`
-	Number  int       `json:"number"`
-	URL     string    `json:"url"`
-	Image   string    `json:"image"`
-	Name    string    `json:"name"`
-	Year    string    `json:"year"`
-	Links   []Link    `json:"links"`
-	Details Details   `json:"details"`
+	ID            uuid.UUID     `json:"id"`
+	URL           string        `json:"url"`
+	Name          string        `json:"name"`
+	Year          string        `json:"year"`
+	Links         []Link        `json:"links"`
+	Details       Details       `json:"details"`
+	DisplayMovies DisplayMovies `json:"displayMovies"`
 }
 type Link struct {
 	QualitySize string `json:"quality_size"`
@@ -30,8 +29,16 @@ type Details struct {
 	Summary    string   `json:"summary"`
 	YoutubeURL string   `json:"youtube_url"`
 }
-
 type PageData struct {
 	Response *http.Response
 	Doc      *goquery.Document
+	URL      string `json:"url"`
+	Err      error
 }
+
+// create movie
+// display all first page
+// name, image
+
+// in movie page
+// all movie info

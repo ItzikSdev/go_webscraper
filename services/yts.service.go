@@ -1,12 +1,10 @@
 package services
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"mogodum/models"
 	"net/http"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -33,22 +31,15 @@ func ScrapeYTS(scrapeRequest models.ScrapeRequest) {
 	pagesVisited = 0
 	counter = 1
 	movies = []models.Movie{}
-	// movies in yts website = 60440 3022 pages
 
 	for pagesVisited < scrapeRequest.PAGES {
 		pageToScrape := fmt.Sprintf("%s?page=%d", baseURL, pagesVisited+1)
 		log.Printf("Scraping Page: %d, URL: %s", pagesVisited+1, pageToScrape)
 		pageData := PageToScrape(pageToScrape)
-		newMovies := ScrapeMovie(pageData, counter, pagesVisited)
+		newMovies := ScrapeMovieInYts(pageData, counter, pagesVisited)
 		movies = append(movies, newMovies...)
-		counter += len(newMovies)
+		counter = len(newMovies)
 		pagesVisited++
-	}
-
-	// Save to JSON file or database as needed
-	data, err := json.Marshal(movies)
-	if err == nil {
-		os.WriteFile("movies.json", data, 0644)
 	}
 
 	statusMutex.Lock()
@@ -56,54 +47,81 @@ func ScrapeYTS(scrapeRequest models.ScrapeRequest) {
 	statusMutex.Unlock()
 }
 
-func ScrapeMovie(pageData models.PageData, counter int, pagesVisited int) []models.Movie {
+func movieNotFound(movie models.Movie, statusCode int) models.Movie {
+	log.Print(movie.Name, statusCode)
+	return movie
+}
+
+func ScrapeMovieInYts(pageData models.PageData, counter int, pagesVisited int) []models.Movie {
 	var movies []models.Movie
 	pageData.Doc.Find("ul.tsc_pagination li a[href]")
 	pageData.Doc.Find("div.browse-movie-wrap").Each(func(ii int, s *goquery.Selection) {
 		movie := models.Movie{
-			ID:     uuid.New(),
-			Number: counter + pagesVisited,
-			URL:    FindHref(s),
-			Image:  FindImage(s),
-			Name:   FindName(s),
-			Year:   FindYear(s),
+			ID:   uuid.New(),
+			URL:  FindHref(s),
+			Name: FindName(s),
+			Year: FindYear(s),
 		}
-		inMoviePage := PageToScrape(movie.URL)
 
-		movie.Details = models.Details{
-			Genres:     FindGeners(inMoviePage.Doc),
-			Likes:      FindLikes(inMoviePage.Doc),
-			Rating:     FindRating(inMoviePage.Doc),
-			IMDbURL:    FindIMDB(inMoviePage.Doc),
-			Summary:    FindSummary(inMoviePage.Doc),
-			YoutubeURL: FindYoutubeURL(inMoviePage.Doc),
+		moviePage := PageToScrape(movie.URL)
+
+		if moviePage.Response.StatusCode != 200 {
+			movie = movieNotFound(movie, moviePage.Response.StatusCode)
+		} else {
+			movie.Details = models.Details{
+				Genres:     FindGeners(moviePage.Doc),
+				Likes:      FindLikes(moviePage.Doc),
+				Rating:     FindRating(moviePage.Doc),
+				IMDbURL:    FindIMDB(moviePage.Doc),
+				Summary:    FindSummary(moviePage.Doc),
+				YoutubeURL: FindYoutubeURL(moviePage.Doc),
+			}
+
+			movieIMDB := PageToScrape(movie.Details.IMDbURL)
+
+			if movieIMDB.Response.StatusCode != 200 {
+				movie = movieNotFound(movie, movieIMDB.Response.StatusCode)
+			} else {
+				movie.DisplayMovies = models.DisplayMovies{
+					Name:  movie.Name,
+					Image: FindIMDBImage(movieIMDB.Doc),
+				}
+			}
+			movie.Links = FindLinks(moviePage.Doc)
 		}
-		movie.Links = FindLinks(inMoviePage.Doc)
-
-		counter++
+		CreateJsonFile(pagesVisited, movies)
 		movies = append(movies, movie)
 		log.Printf("Scraped Movie: %s", movie.Name)
+		counter++
 	})
 	return movies
 }
 
 func PageToScrape(pageToScrape string) models.PageData {
-	res, err := http.Get(pageToScrape)
+	req, err := http.NewRequest("GET", pageToScrape, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3")
+
+	client := &http.Client{}
+	res, err := client.Do(req)
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer res.Body.Close()
 
+	doc, err := goquery.NewDocumentFromReader(res.Body)
+
 	if res.StatusCode != 200 {
-		log.Fatalf("status code error: %d %s", res.StatusCode, res.Status)
-		return models.PageData{Response: res, Doc: nil}
+		log.Printf("page: %s, status code error: %d %s", pageToScrape, res.StatusCode, res.Status)
+		return models.PageData{Response: res, Doc: doc, URL: pageToScrape}
 	}
 
-	doc, err := goquery.NewDocumentFromReader(res.Body)
 	if err != nil {
-		log.Fatal(err)
-		return models.PageData{Response: res, Doc: doc}
+		log.Print(err)
+		return models.PageData{Response: res, Doc: doc, URL: pageToScrape, Err: err}
 	}
 	return models.PageData{Response: res, Doc: doc}
 }
@@ -126,7 +144,9 @@ func FindImage(s *goquery.Selection) string {
 
 func FindName(s *goquery.Selection) string {
 	title := s.Find("a.browse-movie-title").Text()
-	return title
+	re := regexp.MustCompile(`^\[.*?\]\s*`)
+	cleanedTitle := re.ReplaceAllString(title, "")
+	return cleanedTitle
 }
 
 func FindYear(s *goquery.Selection) string {
@@ -171,7 +191,6 @@ func FindLikes(doc *goquery.Document) float64 {
 	doc.Find("div.bottom-info").Each(func(i int, s *goquery.Selection) {
 		movieLikes := s.Find("span#movie-likes").Text()
 		if movieLikes == "" {
-			log.Printf("Empty likes found")
 			return
 		}
 		float, err := strconv.ParseFloat(strings.ReplaceAll(movieLikes, ",", "."), 64)
@@ -203,6 +222,19 @@ func FindIMDB(doc *goquery.Document) string {
 	imdbLink := doc.Find("a.icon[href*='imdb.com']")
 	imdbURL, _ = imdbLink.Attr("href")
 	return imdbURL
+}
+
+func FindIMDBImage(doc *goquery.Document) string {
+	var imageSrc string
+	doc.Find("img.ipc-image").EachWithBreak(func(i int, s *goquery.Selection) bool {
+		i++
+		if src, exists := s.Attr("src"); exists {
+			imageSrc = src
+			return false
+		}
+		return true
+	})
+	return imageSrc
 }
 
 func FindSummary(doc *goquery.Document) string {
@@ -240,22 +272,4 @@ func FindYoutubeURL(doc *goquery.Document) string {
 	youtube := doc.Find("a.youtube[href*='youtube.com']")
 	youtubeUrl, _ = youtube.Attr("href")
 	return youtubeUrl
-}
-
-func CreateJsonFile(movies []models.Movie) {
-	file, err := os.Create("movies.json")
-	if err != nil {
-		fmt.Println("Error creating file:", err)
-		return
-	}
-	defer file.Close()
-
-	// Create a JSON encoder and encode the data
-	encoder := json.NewEncoder(file)
-	err = encoder.Encode(movies)
-
-	if err != nil {
-		fmt.Println("Error encoding JSON:", err)
-		return
-	}
 }
